@@ -1,0 +1,66 @@
+#* SDoH_variables_all_patients:
+#*   desc: combines person, location, and external datasets to generate table of SDoH
+#*     variables for all patients in dataset
+#*   ext: py
+#*   inputs:
+#*   - BU_SC_SDOH_N3C_2018_20201130
+#*   - ds_1_1_ZIP_COUNTY_HUD_file
+#*   - location
+#*   - person
+#*   - ZCTA_by_SDoH_percentages
+#*   - ZiptoZcta_Crosswalk_2021_ziptozcta2020
+#* 
+
+def Logic_Liaison_SDoH_Variables_for_All_Patients(BU_SC_SDOH_N3C_2018_20201130, ds_1_1_ZIP_COUNTY_HUD_file, location, person, ZCTA_by_SDoH_percentages, ZiptoZcta_Crosswalk_2021_ziptozcta2020):
+    
+    person_sample = person \
+        .select('person_id','location_id', 'data_partner_id')
+        
+    location_df = location \
+        .dropDuplicates(subset=['location_id']) \
+        .select('location_id','city','state','zip','county') \
+        .withColumnRenamed('zip','postal_code')   
+
+    #all variables from ZCTA/zip level
+    #create crosswalk between ZCTA file and zip code (mostly exact match but includes a few that are spatial joins)
+    ZCTA_sdoh_df = ZCTA_by_SDoH_percentages \
+        .join(ZiptoZcta_Crosswalk_2021_ziptozcta2020
+            .select('ZCTA', 'ZIP_CODE')
+            .dropDuplicates(subset=['ZIP_CODE'])
+            .withColumnRenamed('ZIP_CODE', 'Five_Digit_Zip'),
+            on = ['ZCTA'], how = 'inner') 
+
+    #select county level SDoH variables that do not exist at the more granular level (ZCTA/zip)
+    #create crosswalk between BU Share Care file and zip code using Preferred County 
+    BU_sdoh_df = BU_SC_SDOH_N3C_2018_20201130.select('FIPS_CODE', 'percent_voted_house_16', 'social_community_score', 'MDs', 'sdoh2')
+    BU_sdoh_df = BU_sdoh_df.toDF('Preferred_County_FIPS', *[col + '_by_preferred_county' for col in BU_sdoh_df.columns if col not in ('FIPS_CODE')]) \
+        .join(ds_1_1_ZIP_COUNTY_HUD_file
+            .select('Preferred_county', 'ZIP')
+            .dropDuplicates(subset=['ZIP'])
+            .withColumnRenamed('ZIP','Five_Digit_Zip')
+            .withColumnRenamed('Preferred_county', 'Preferred_County_FIPS'),
+            on = ['Preferred_County_FIPS'], how = 'inner')           
+
+    #join in location_df to person_sample
+    #transform all postal code values that contain less than 5 digits into null values
+    #subsets any postal code values with 5+ digits (if any) to be only 5 digits
+    df = person_sample.join(location_df, 'location_id', 'left') \
+        .withColumn('Five_Digit_Zip', 
+            F.when(F.length(F.col('postal_code')) >= 5, F.col('postal_code'))
+            .otherwise(F.lit(None))) \
+        .withColumn('Five_Digit_Zip', 
+            F.when(F.length(F.col('postal_code')) > 5, F.substring('postal_code', 1,5))
+            .otherwise(F.col('Five_Digit_Zip'))) 
+
+    #join in ZCTA/zip level and county level data to persons with 5 digit zips
+    df = df.join(ZCTA_sdoh_df, 'Five_Digit_Zip', 'left') 
+    df = df.join(BU_sdoh_df, 'Five_Digit_Zip', 'left')
+
+    return df
+
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType
